@@ -67,6 +67,37 @@ async function sendButtons(to, message, buttons) {
     );
 }
 
+async function sendList(to, message, items) {
+    await axios.post(
+        `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
+        {
+            messaging_product: 'whatsapp',
+            to: to,
+            type: 'interactive',
+            interactive: {
+                type: 'list',
+                body: { text: message },
+                action: {
+                    button: 'Ver opciones',
+                    sections: [{
+                        title: 'Camiones disponibles',
+                        rows: items.map(item => ({
+                            id: item.id,
+                            title: item.title
+                        }))
+                    }]
+                }
+            }
+        },
+        {
+            headers: {
+                'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
+                'Content-Type': 'application/json'
+            }
+        }
+    );
+}
+
 async function downloadMedia(mediaId) {
     const mediaResponse = await axios.get(
         `https://graph.facebook.com/v18.0/${mediaId}`,
@@ -235,7 +266,6 @@ app.post('/webhook', async (req, res) => {
     const usuario = message.from;
     const tipo = message.type;
 
-    // Usuario manda foto → guardarla y mostrar botones
     if (tipo === 'image') {
         const mediaId = message.image.id;
         const media = await downloadMedia(mediaId);
@@ -249,13 +279,12 @@ app.post('/webhook', async (req, res) => {
         return;
     }
 
-    // Usuario toca un botón
     if (tipo === 'interactive') {
-        const buttonId = message.interactive.button_reply.id;
+        const buttonId = message.interactive.button_reply?.id || message.interactive.list_reply?.id;
 
         if (buttonId === 'crear_cierre') {
             estadoUsuarios[usuario] = { ...estadoUsuarios[usuario], opcion: 'esperando_camion' };
-            await sendButtons(usuario, '🚛 ¿Qué camión?', [
+            await sendList(usuario, '🚛 ¿Qué camión?', [
                 { id: 'camion_HFSW85', title: 'HFSW85' },
                 { id: 'camion_RXTH24', title: 'RXTH24' },
                 { id: 'camion_PCTV91', title: 'PCTV91' },
@@ -277,7 +306,6 @@ app.post('/webhook', async (req, res) => {
         }
     }
 
-    // Si manda texto
     if (tipo === 'text') {
         await sendMessage(usuario, '📸 Manda una foto de la guía para comenzar.');
     }
