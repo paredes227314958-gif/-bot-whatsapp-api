@@ -40,6 +40,33 @@ async function sendMessage(to, message) {
     );
 }
 
+async function sendButtons(to, message, buttons) {
+    await axios.post(
+        `https://graph.facebook.com/v18.0/${PHONE_NUMBER_ID}/messages`,
+        {
+            messaging_product: 'whatsapp',
+            to: to,
+            type: 'interactive',
+            interactive: {
+                type: 'button',
+                body: { text: message },
+                action: {
+                    buttons: buttons.map(btn => ({
+                        type: 'reply',
+                        reply: { id: btn.id, title: btn.title }
+                    }))
+                }
+            }
+        },
+        {
+            headers: {
+                'Authorization': `Bearer ${WHATSAPP_TOKEN}`,
+                'Content-Type': 'application/json'
+            }
+        }
+    );
+}
+
 async function downloadMedia(mediaId) {
     const mediaResponse = await axios.get(
         `https://graph.facebook.com/v18.0/${mediaId}`,
@@ -56,6 +83,133 @@ async function downloadMedia(mediaId) {
         data: Buffer.from(imageResponse.data).toString('base64'),
         mimeType: imageResponse.headers['content-type']
     };
+}
+
+async function procesarCierre(usuario, patente, chofer) {
+    const media = estadoUsuarios[usuario].foto;
+    try {
+        const response = await anthropic.messages.create({
+            model: 'claude-haiku-4-5',
+            max_tokens: 200,
+            messages: [{
+                role: 'user',
+                content: [
+                    {
+                        type: 'image',
+                        source: {
+                            type: 'base64',
+                            media_type: media.mimeType,
+                            data: media.data
+                        }
+                    },
+                    {
+                        type: 'text',
+                        text: `Analiza esta imagen de una guía de envío de Sodimac.
+                        Extrae exactamente estos dos datos:
+                        1. El valor que aparece al lado de "Origen:"
+                        2. El valor numérico que aparece al lado de "Id.Ruta:"
+                        
+                        Responde ÚNICAMENTE en este formato JSON exacto, sin texto adicional:
+                        {"tienda": "VALOR", "id": "VALOR"}
+                        
+                        Si no encuentras algún valor, pon "NO_ENCONTRADO" en ese campo.`
+                    }
+                ]
+            }]
+        });
+
+        const respuestaTexto = response.content[0].text.trim();
+        const jsonLimpio = respuestaTexto.replace(/```json|```/g, '').trim();
+        const datos = JSON.parse(jsonLimpio);
+
+        if (datos.tienda === 'NO_ENCONTRADO' || datos.id === 'NO_ENCONTRADO') {
+            await sendMessage(usuario, '⚠️ No pude leer la imagen. Intenta con una foto más clara.');
+            return;
+        }
+
+        await sendMessage(usuario,
+`Transporte: Virgen de la puerta
+Chofer: ${chofer}
+Patente: ${patente}
+Tienda: ${datos.tienda}
+ID: ${datos.id}
+Ruta al 100% ✅`);
+
+        estadoUsuarios[usuario] = null;
+
+    } catch (error) {
+        console.error('Error cierre:', error);
+        await sendMessage(usuario, '⚠️ No pude leer la imagen. Intenta con una foto más clara.');
+    }
+}
+
+async function procesarRuta(usuario) {
+    const media = estadoUsuarios[usuario].foto;
+    try {
+        await sendMessage(usuario, '⏳ Analizando el informe, espera un momento...');
+
+        const response = await anthropic.messages.create({
+            model: 'claude-haiku-4-5',
+            max_tokens: 3000,
+            messages: [{
+                role: 'user',
+                content: [
+                    {
+                        type: 'image',
+                        source: {
+                            type: 'base64',
+                            media_type: media.mimeType,
+                            data: media.data
+                        }
+                    },
+                    {
+                        type: 'text',
+                        text: `Lee este documento de Sodimac Chile con mucho cuidado.
+                        Extrae TODAS las direcciones de entrega de cada reserva.
+                        Cada bloque empieza con "Reserva:" y tiene una COMUNA en mayúsculas después de "Canal:XX".
+                        La dirección tiene nombre de calle y número.
+                        
+                        REGLAS:
+                        - Solo extrae lo que aparece literalmente
+                        - NO incluyas nombres de personas ni productos
+                        - Una dirección DEBE tener número
+                        - NO repitas direcciones
+                        
+                        Responde ÚNICAMENTE con este JSON:
+                        {"direcciones": ["COMUNA, CALLE NUMERO, Chile"]}
+                        
+                        Si no encuentras: {"direcciones": []}`
+                    }
+                ]
+            }]
+        });
+
+        const respuestaTexto = response.content[0].text.trim();
+        const jsonLimpio = respuestaTexto.replace(/```json|```/g, '').trim();
+        const datos = JSON.parse(jsonLimpio);
+
+        if (!datos.direcciones || datos.direcciones.length === 0) {
+            await sendMessage(usuario, '⚠️ No encontré direcciones. Intenta con una foto más clara.');
+            return;
+        }
+
+        const direccionesUnicas = [...new Set(datos.direcciones)];
+        const linkCompleto = `https://www.google.com/maps/dir/${direccionesUnicas.map(d => encodeURIComponent(d)).join('/')}`;
+
+        await sendMessage(usuario, `🗺️ Ruta generada con ${direccionesUnicas.length} paradas:\n\n🔗 Ver ruta completa:\n${linkCompleto}`);
+
+        for (let i = 0; i < direccionesUnicas.length; i++) {
+            const direccion = direccionesUnicas[i];
+            const linkParada = `https://maps.google.com/?q=${encodeURIComponent(direccion)}`;
+            await sendMessage(usuario, `📍 Parada ${i + 1}:\n${direccion}\n🔗 ${linkParada}`);
+        }
+
+        estadoUsuarios[usuario] = null;
+
+    } catch (error) {
+        console.error('Error ruta:', error);
+        await sendMessage(usuario, '⚠️ Ocurrió un error. Intenta de nuevo.');
+    }
 }
 
 app.get('/webhook', (req, res) => {
@@ -81,192 +235,51 @@ app.post('/webhook', async (req, res) => {
     const usuario = message.from;
     const tipo = message.type;
 
-    if (tipo === 'text') {
-        const texto = message.text.body.trim();
-        const textoLower = texto.toLowerCase();
-
-        if (textoLower === 'menu' || textoLower === 'hola' || textoLower === 'inicio') {
-            estadoUsuarios[usuario] = { opcion: 'esperando_menu' };
-            await sendMessage(usuario, '👋 Bienvenido! ¿Qué deseas hacer?\n\n1️⃣ Crear cierre\n2️⃣ Crear ruta');
-            return;
-        }
-
-        if (estadoUsuarios[usuario]?.opcion === 'esperando_menu') {
-            if (texto === '1' || textoLower === 'crear cierre') {
-                estadoUsuarios[usuario] = { opcion: 'esperando_camion' };
-                await sendMessage(usuario, '🚛 ¿Qué camión?\n\n1️⃣ HFSW85\n2️⃣ RXTH24\n3️⃣ PCTV91\n4️⃣ KBFD31');
-                return;
-            }
-            if (texto === '2' || textoLower === 'crear ruta') {
-                estadoUsuarios[usuario] = { opcion: 'ruta' };
-                await sendMessage(usuario, '🗺️ Perfecto! Envía la foto del informe de carga para generar la ruta.');
-                return;
-            }
-            await sendMessage(usuario, '⚠️ Opción no válida.\n\n1️⃣ Para crear cierre\n2️⃣ Para crear ruta');
-            return;
-        }
-
-        if (estadoUsuarios[usuario]?.opcion === 'esperando_camion') {
-            const opciones = { '1': 'HFSW85', '2': 'RXTH24', '3': 'PCTV91', '4': 'KBFD31' };
-            const patente = opciones[texto] || texto.toUpperCase().trim();
-            if (camiones[patente]) {
-                estadoUsuarios[usuario] = { opcion: 'cierre', patente: patente, chofer: camiones[patente] };
-                await sendMessage(usuario, `✅ Camión ${patente} seleccionado.\n📋 Ahora envía la foto de la guía.`);
-            } else {
-                await sendMessage(usuario, '⚠️ Opción no válida.\n\n1️⃣ HFSW85\n2️⃣ RXTH24\n3️⃣ PCTV91\n4️⃣ KBFD31');
-            }
-            return;
-        }
-
-        if (textoLower === 'crear ruta') {
-            estadoUsuarios[usuario] = { opcion: 'ruta' };
-            await sendMessage(usuario, '🗺️ Perfecto! Envía la foto del informe de carga para generar la ruta.');
-            return;
-        }
-
-        if (textoLower === 'crear cierre') {
-            estadoUsuarios[usuario] = { opcion: 'esperando_camion' };
-            await sendMessage(usuario, '🚛 ¿Qué camión?\n\n1️⃣ HFSW85\n2️⃣ RXTH24\n3️⃣ PCTV91\n4️⃣ KBFD31');
-            return;
-        }
-
-        if (!estadoUsuarios[usuario]?.opcion) {
-            await sendMessage(usuario, 'Escribe *hola* para ver el menú.');
-        }
-    }
-
+    // Usuario manda foto → guardarla y mostrar botones
     if (tipo === 'image') {
-        if (!estadoUsuarios[usuario]?.opcion || estadoUsuarios[usuario]?.opcion === 'esperando_menu' || estadoUsuarios[usuario]?.opcion === 'esperando_camion') {
-            await sendMessage(usuario, 'Por favor primero elige una opción:\n\n1️⃣ Crear cierre\n2️⃣ Crear ruta');
-            return;
-        }
-
         const mediaId = message.image.id;
         const media = await downloadMedia(mediaId);
 
-        if (estadoUsuarios[usuario].opcion === 'cierre') {
-            const patente = estadoUsuarios[usuario].patente;
-            const chofer = estadoUsuarios[usuario].chofer;
+        estadoUsuarios[usuario] = { foto: media, opcion: 'esperando_opcion' };
 
-            try {
-                const response = await anthropic.messages.create({
-                    model: 'claude-haiku-4-5',
-                    max_tokens: 200,
-                    messages: [{
-                        role: 'user',
-                        content: [
-                            {
-                                type: 'image',
-                                source: {
-                                    type: 'base64',
-                                    media_type: media.mimeType,
-                                    data: media.data
-                                }
-                            },
-                            {
-                                type: 'text',
-                                text: `Analiza esta imagen de una guía de envío de Sodimac.
-                                Extrae exactamente estos dos datos:
-                                1. El valor que aparece al lado de "Origen:"
-                                2. El valor numérico que aparece al lado de "Id.Ruta:"
-                                
-                                Responde ÚNICAMENTE en este formato JSON exacto, sin texto adicional:
-                                {"tienda": "VALOR", "id": "VALOR"}
-                                
-                                Si no encuentras algún valor, pon "NO_ENCONTRADO" en ese campo.`
-                            }
-                        ]
-                    }]
-                });
+        await sendButtons(usuario, '📋 ¿Qué deseas hacer con esta imagen?', [
+            { id: 'crear_cierre', title: '📋 Crear cierre' },
+            { id: 'crear_ruta', title: '🗺️ Crear ruta' }
+        ]);
+        return;
+    }
 
-                const respuestaTexto = response.content[0].text.trim();
-                const jsonLimpio = respuestaTexto.replace(/```json|```/g, '').trim();
-                const datos = JSON.parse(jsonLimpio);
+    // Usuario toca un botón
+    if (tipo === 'interactive') {
+        const buttonId = message.interactive.button_reply.id;
 
-                if (datos.tienda === 'NO_ENCONTRADO' || datos.id === 'NO_ENCONTRADO') {
-                    await sendMessage(usuario, '⚠️ No pude leer la imagen. Intenta con una foto más clara.');
-                    return;
-                }
-
-                await sendMessage(usuario,
-`Transporte: Virgen de la puerta
-Chofer: ${chofer}
-Patente: ${patente}
-Tienda: ${datos.tienda}
-ID: ${datos.id}
-Ruta al 100% ✅`);
-
-            } catch (error) {
-                console.error('Error cierre:', error);
-                await sendMessage(usuario, '⚠️ No pude leer la imagen. Intenta con una foto más clara.');
-            }
+        if (buttonId === 'crear_cierre') {
+            estadoUsuarios[usuario] = { ...estadoUsuarios[usuario], opcion: 'esperando_camion' };
+            await sendButtons(usuario, '🚛 ¿Qué camión?', [
+                { id: 'camion_HFSW85', title: 'HFSW85' },
+                { id: 'camion_RXTH24', title: 'RXTH24' },
+                { id: 'camion_PCTV91', title: 'PCTV91' },
+                { id: 'camion_KBFD31', title: 'KBFD31' }
+            ]);
+            return;
         }
 
-        if (estadoUsuarios[usuario].opcion === 'ruta') {
-            try {
-                await sendMessage(usuario, '⏳ Analizando el informe, espera un momento...');
-
-                const response = await anthropic.messages.create({
-                    model: 'claude-haiku-4-5',
-                    max_tokens: 3000,
-                    messages: [{
-                        role: 'user',
-                        content: [
-                            {
-                                type: 'image',
-                                source: {
-                                    type: 'base64',
-                                    media_type: media.mimeType,
-                                    data: media.data
-                                }
-                            },
-                            {
-                                type: 'text',
-                                text: `Lee este documento de Sodimac Chile con mucho cuidado.
-                                Extrae TODAS las direcciones de entrega de cada reserva.
-                                Cada bloque empieza con "Reserva:" y tiene una COMUNA en mayúsculas después de "Canal:XX".
-                                La dirección tiene nombre de calle y número.
-                                
-                                REGLAS:
-                                - Solo extrae lo que aparece literalmente
-                                - NO incluyas nombres de personas ni productos
-                                - Una dirección DEBE tener número
-                                - NO repitas direcciones
-                                
-                                Responde ÚNICAMENTE con este JSON:
-                                {"direcciones": ["COMUNA, CALLE NUMERO, Chile"]}
-                                
-                                Si no encuentras: {"direcciones": []}`
-                            }
-                        ]
-                    }]
-                });
-
-                const respuestaTexto = response.content[0].text.trim();
-                const jsonLimpio = respuestaTexto.replace(/```json|```/g, '').trim();
-                const datos = JSON.parse(jsonLimpio);
-
-                if (!datos.direcciones || datos.direcciones.length === 0) {
-                    await sendMessage(usuario, '⚠️ No encontré direcciones. Intenta con una foto más clara.');
-                    return;
-                }
-
-                const direccionesUnicas = [...new Set(datos.direcciones)];
-                const linkCompleto = `https://www.google.com/maps/dir/${direccionesUnicas.map(d => encodeURIComponent(d)).join('/')}`;
-
-                await sendMessage(usuario, `🗺️ Ruta generada con ${direccionesUnicas.length} paradas:\n\n🔗 Ver ruta completa:\n${linkCompleto}`);
-
-                for (let i = 0; i < direccionesUnicas.length; i++) {
-                    const direccion = direccionesUnicas[i];
-                    const linkParada = `https://maps.google.com/?q=${encodeURIComponent(direccion)}`;
-                    await sendMessage(usuario, `📍 Parada ${i + 1}:\n${direccion}\n🔗 ${linkParada}`);
-                }
-
-            } catch (error) {
-                console.error('Error ruta:', error);
-                await sendMessage(usuario, '⚠️ Ocurrió un error. Intenta de nuevo.');
-            }
+        if (buttonId === 'crear_ruta') {
+            await procesarRuta(usuario);
+            return;
         }
+
+        if (buttonId.startsWith('camion_')) {
+            const patente = buttonId.replace('camion_', '');
+            const chofer = camiones[patente];
+            await procesarCierre(usuario, patente, chofer);
+            return;
+        }
+    }
+
+    // Si manda texto
+    if (tipo === 'text') {
+        await sendMessage(usuario, '📸 Manda una foto de la guía para comenzar.');
     }
 });
 
